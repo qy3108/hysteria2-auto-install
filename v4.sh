@@ -13,7 +13,7 @@ fi
 # IPv4 + 指定防火墙端口 + Hysteria 2 + 自签证书
 #
 # 防火墙规则只添加，不清空、不重置、不修改默认策略
-# 自动生成并覆盖 Hy2 config.yaml
+# 首次安装时生成 Hy2 config.yaml；已有完整配置时直接复用，不覆盖
 # ============================================================
 
 VERSION="1.0.0"
@@ -71,6 +71,144 @@ apt-get install -y \
 
 
 unset DEBIAN_FRONTEND
+
+
+# ------------------------------------------------------------
+# 检查并复用已有 Hysteria 2 配置
+# ------------------------------------------------------------
+
+declare -A HY2_USERS=()
+HY2_USER_SUMMARY=""
+USER_COUNT=0
+HY2_CONFIG_REUSED=0
+
+load_existing_hy2_config() {
+    local config="${CERT_DIR}/config.yaml"
+    local users_text cert_pub key_pub hex_fp hyper_fp pub_b64 username password
+    local parsed_summary=""
+    local -A parsed_users=()
+
+    # 配置、证书、私钥和服务单元必须同时存在
+    [[ -s "$config" && -s "$CERT_CRT" && -s "$CERT_KEY" ]] || return 1
+    systemctl cat hysteria-server.service >/dev/null 2>&1 || return 1
+
+    # 验证证书和私钥均可读取，且确实属于同一对密钥
+    openssl x509 -in "$CERT_CRT" -noout >/dev/null 2>&1 || return 1
+    openssl pkey -in "$CERT_KEY" -noout >/dev/null 2>&1 || return 1
+
+    cert_pub="$(openssl x509 -in "$CERT_CRT" -pubkey -noout 2>/dev/null |
+        openssl pkey -pubin -outform DER 2>/dev/null |
+        sha256sum | awk '{print $1}')" || return 1
+    key_pub="$(openssl pkey -in "$CERT_KEY" -pubout -outform DER 2>/dev/null |
+        sha256sum | awk '{print $1}')" || return 1
+    [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]] || return 1
+
+    # 验证配置监听端口、证书路径和 userpass 账号段，并读取原账号密码
+    users_text="$(python3 - "$config" <<'PYTHON'
+import re
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+if not re.search(r"(?m)^listen:\s*:10086\s*$", text):
+    raise SystemExit(1)
+if not re.search(r"(?m)^\s{2}cert:\s*/etc/hysteria/server\.crt\s*$", text):
+    raise SystemExit(1)
+if not re.search(r"(?m)^\s{2}key:\s*/etc/hysteria/server\.key\s*$", text):
+    raise SystemExit(1)
+
+lines = text.splitlines()
+auth_index = next((i for i, line in enumerate(lines)
+                   if re.match(r"^auth:\s*$", line)), None)
+if auth_index is None:
+    raise SystemExit(1)
+
+userpass_index = None
+for i in range(auth_index + 1, len(lines)):
+    if re.match(r"^\s{2}userpass:\s*$", lines[i]):
+        userpass_index = i
+        break
+    if lines[i].strip() and not lines[i].startswith(" "):
+        break
+if userpass_index is None:
+    raise SystemExit(1)
+
+accounts = []
+for line in lines[userpass_index + 1:]:
+    if not line.strip():
+        continue
+    indent = len(line) - len(line.lstrip())
+    if indent <= 2:
+        break
+    match = re.match(r'^\s{4,}"([^"\r\n]+)"\s*:\s*"([^"\r\n]+)"\s*$', line)
+    if match:
+        username, password = match.groups()
+        if "\t" in username or "\n" in username or "\t" in password or "\n" in password:
+            raise SystemExit(1)
+        accounts.append((username, password))
+
+if not accounts:
+    raise SystemExit(1)
+for username, password in accounts:
+    print(f"{username}\t{password}")
+PYTHON
+    )" || return 1
+
+    [[ -n "$users_text" ]] || return 1
+
+    while IFS=$'\t' read -r username password; do
+        [[ -n "$username" && -n "$password" ]] || continue
+        parsed_users["$username"]="$password"
+        parsed_summary+="${username}: ${password}"$'\n'
+    done <<< "$users_text"
+
+    [[ "${#parsed_users[@]}" -gt 0 ]] || return 1
+
+    # 从现有证书重新计算指纹，不生成新证书
+    hex_fp="$(openssl x509 -noout -fingerprint -sha256 -in "$CERT_CRT" |
+        cut -d'=' -f2 | tr -d ':' | tr 'A-F' 'a-f')" || return 1
+    [[ "$hex_fp" =~ ^[0-9a-f]{64}$ ]] || return 1
+    hyper_fp="${hex_fp^^}"
+
+    pub_b64="$(openssl x509 -in "$CERT_CRT" -pubkey -noout |
+        openssl pkey -pubin -outform der |
+        openssl dgst -sha256 -binary |
+        openssl enc -base64)" || return 1
+
+    # 上述检查全部成功后，才提交读取结果，避免失败时残留半套变量
+    HY2_USERS=()
+    for username in "${!parsed_users[@]}"; do
+        HY2_USERS["$username"]="${parsed_users[$username]}"
+    done
+    HY2_USER_SUMMARY="$parsed_summary"
+    USER_COUNT="${#HY2_USERS[@]}"
+    HEX_FP="$hex_fp"
+    HYPER_FP="$hyper_fp"
+    PUB_B64="$pub_b64"
+
+    # 只补齐缺失的指纹文件；不改动现有证书、账号和 Hy2 配置
+    if [[ ! -s "${CERT_DIR}/fingerprint.txt" ]]; then
+        cat > "${CERT_DIR}/fingerprint.txt" <<EOF
+通用无冒号指纹 (v2rayN/Shadowrocket/Clash):
+$HEX_FP
+
+sing-box 1.14 专用指纹 (certificate_public_key_sha256):
+$PUB_B64
+EOF
+        chmod 644 "${CERT_DIR}/fingerprint.txt"
+    fi
+
+    return 0
+}
+
+if load_existing_hy2_config; then
+    HY2_CONFIG_REUSED=1
+    log "检测到已有完整 Hy2 配置，将保留原账号、密码、证书和指纹"
+    log "现有 Hy2 账号数量：${USER_COUNT}"
+else
+    log "未检测到完整可复用的 Hy2 配置，将执行首次安装/配置"
+fi
+
 
 
 # ------------------------------------------------------------
@@ -200,6 +338,7 @@ netfilter-persistent save
 
 systemctl enable netfilter-persistent >/dev/null 2>&1 || true
 
+if [[ "$HY2_CONFIG_REUSED" -eq 0 ]]; then
 # ------------------------------------------------------------
 # 12. 安装 Hysteria 2
 # ------------------------------------------------------------
@@ -229,6 +368,11 @@ mkdir -p "$CERT_DIR"
 # 设置 Hy2 配置目录权限
 chown root:hysteria "$CERT_DIR"
 chmod 750 "$CERT_DIR"
+
+# 如果已有配置文件，先备份
+if [[ -f "$CERT_DIR/config.yaml" ]]; then
+    cp -a "$CERT_DIR/config.yaml" "$BACKUP_DIR/config.yaml.before"
+fi
 
 # 如果已有证书，先备份
 if [[ -f "$CERT_KEY" ]]; then
@@ -272,8 +416,6 @@ log "开始自动生成 Hysteria 2 用户账号..."
 # 每次运行自动生成 1 组随机账号和密码
 USER_COUNT=1
 
-declare -A HY2_USERS
-HY2_USER_SUMMARY=""
 
 # 随机生成用户名：hy2-加8位随机十六进制字符
 USERNAME="hy2-$(openssl rand -hex 4)"
@@ -383,6 +525,10 @@ chmod 644 "$CERT_DIR/fingerprint.txt"
 
 log "证书指纹已保存至 $CERT_DIR/fingerprint.txt"
 
+else
+    log "复用现有 Hy2 配置，跳过安装、证书生成、账号生成和 config.yaml 写入"
+fi
+
 # ------------------------------------------------------------
 # 启用 Hy2 开机启动并启动服务
 # ------------------------------------------------------------
@@ -391,9 +537,12 @@ log "启用 Hy2 开机启动..."
 
 systemctl enable hysteria-server.service
 
-log "启动 Hy2 服务..."
-
-systemctl restart hysteria-server.service
+if [[ "$HY2_CONFIG_REUSED" -eq 1 ]] && systemctl is-active --quiet hysteria-server.service; then
+    log "现有 Hy2 服务已经运行，不重启服务，避免影响正在使用的协议族"
+else
+    log "启动 Hy2 服务..."
+    systemctl restart hysteria-server.service
+fi
 
 log "检查 Hy2 服务状态..."
 
@@ -444,7 +593,7 @@ echo
 echo "【防火墙】"
 echo "原有规则未清空"
 echo "默认策略未修改"
-echo "只添加本脚本指定的 IPv4 端口规则"
+echo "只添加本脚本指定的 IPv4 端口规则；已有 Hy2 配置不会被覆盖"
 
 echo
 echo "【备份目录】"
